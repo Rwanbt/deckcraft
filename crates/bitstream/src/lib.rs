@@ -497,7 +497,7 @@ mod tests {
             let parsed = length_prefixed_nals(&encoded, prefix_size).unwrap();
             assert_eq!(parsed.len(), chunks.len());
             for (actual, expected) in parsed.iter().zip(&chunks) {
-                assert_eq!(*actual, expected, "NAL payload must be lossless");
+                assert_eq!(*actual, expected.as_slice(), "NAL payload must be lossless");
             }
         }
     }
