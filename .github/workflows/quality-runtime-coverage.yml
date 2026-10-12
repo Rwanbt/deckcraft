@@ -1,0 +1,71 @@
+name: Quality coverage (runtime and CLI)
+
+# Independent instrumented report for DeckCraft's stateful core and real-process CLI.
+# This is a partial baseline; numbers must not be mislabeled as full workspace coverage.
+on:
+  pull_request:
+    paths:
+      - "apps/deckcraft-cli/**"
+      - "crates/engine/**"
+      - "crates/model/**"
+      - "crates/mcp/**"
+      - ".github/workflows/quality-runtime-coverage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  instrument:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CRAFT_FONTS_REF: 43913056ce82a3fdad0ef69f6b88d1dc922a8104
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out reproducible fonts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REF }}
+          path: craft-fonts
+      - name: Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: runtime-llvm-cov
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Instrumented runtime and CLI tests
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: |
+          cargo llvm-cov --locked \
+            -p deckcraft-engine \
+            -p deckcraft-model \
+            -p deckcraft-mcp \
+            -p deckcraft-cli \
+            --lcov --output-path coverage-runtime.lcov
+          cargo llvm-cov report --json --output-path coverage-runtime.json
+          cargo llvm-cov report --summary-only
+      - name: Upload raw reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-runtime-${{ github.sha }}
+          path: |
+            coverage-runtime.lcov
+            coverage-runtime.json
+          if-no-files-found: warn
+          retention-days: 30
