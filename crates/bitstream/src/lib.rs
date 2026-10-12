@@ -441,6 +441,68 @@ mod tests {
     }
 
     #[test]
+    fn reader_reports_truncation_and_excessive_exp_golomb_prefix() {
+        assert_eq!(BitReader::new(&[]).read_ue(), Err(BitError::Eof));
+        assert_eq!(BitReader::new(&[0; 4]).read_ue(), Err(BitError::Eof));
+        assert_eq!(BitReader::new(&[0; 5]).read_ue(), Err(BitError::InvalidExpGolomb));
+
+        let mut writer = BitWriter::new();
+        writer.write_ue(u32::MAX);
+        let bytes = writer.finish();
+        assert_eq!(BitReader::new(&bytes).read_ue(), Ok(u32::MAX));
+    }
+
+    #[test]
+    fn unaligned_writes_and_reads_preserve_exact_payload_bits() {
+        let mut writer = BitWriter::new();
+        writer.write_bits(0b101, 3);
+        writer.write_bytes(&[0xA5, 0xFF]);
+        assert_eq!(writer.bit_len(), 19);
+        writer.align_zero();
+        let encoded = writer.finish();
+        assert_eq!(encoded.len(), 3);
+
+        let mut reader = BitReader::new(&encoded);
+        assert_eq!(reader.peek(3), 0b101);
+        assert_eq!(reader.position(), 0, "peek must not advance the cursor");
+        assert_eq!(reader.read_bits(3), Ok(0b101));
+        assert_eq!(reader.read_bits(8), Ok(0xA5));
+        assert_eq!(reader.read_bits(8), Ok(0xFF));
+        assert_eq!(reader.read_bits(5), Ok(0));
+        assert_eq!(reader.bits_left(), 0);
+    }
+
+    #[test]
+    fn length_prefixed_nals_roundtrip_fixed_seed_corpus() {
+        let mut seed = 0x7A11_2026_5EED_u64;
+        let mut chunks = Vec::new();
+        for len in 0..64 {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 32) as u8
+                })
+                .collect();
+            chunks.push(data);
+        }
+
+        for prefix_size in [1usize, 2, 4] {
+            let mut encoded = Vec::new();
+            for chunk in &chunks {
+                for offset in (0..prefix_size).rev() {
+                    encoded.push((chunk.len() >> (8 * offset)) as u8);
+                }
+                encoded.extend_from_slice(chunk);
+            }
+            let parsed = length_prefixed_nals(&encoded, prefix_size).unwrap();
+            assert_eq!(parsed.len(), chunks.len());
+            for (actual, expected) in parsed.iter().zip(&chunks) {
+                assert_eq!(*actual, expected, "NAL payload must be lossless");
+            }
+        }
+    }
+
+    #[test]
     fn more_rbsp() {
         let d = [0b1100_0000];
         let mut r = BitReader::new(&d);
