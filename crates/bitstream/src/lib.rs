@@ -15,6 +15,8 @@ pub enum BitError {
     Eof,
     /// An Exp-Golomb code longer than 32 leading zeros.
     InvalidExpGolomb,
+    /// AVCC/HVCC NAL units require a 1-, 2- or 4-byte length prefix.
+    InvalidNalLengthSize,
 }
 
 impl fmt::Display for BitError {
@@ -22,6 +24,7 @@ impl fmt::Display for BitError {
         match self {
             BitError::Eof => f.write_str("unexpected end of bitstream"),
             BitError::InvalidExpGolomb => f.write_str("invalid Exp-Golomb code"),
+            BitError::InvalidNalLengthSize => f.write_str("invalid NAL length-prefix size"),
         }
     }
 }
@@ -312,22 +315,29 @@ pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
 
 /// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1/2/4 bytes) into NAL units.
 pub fn length_prefixed_nals(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
+    // A zero-byte prefix never advances the cursor (infinite loop); overlong prefixes
+    // could overflow offset arithmetic or shift counts on a hostile caller's input.
+    if !matches!(length_size, 1 | 2 | 4) {
+        return Err(BitError::InvalidNalLengthSize);
+    }
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        if i + length_size > data.len() {
+        let header_end = i.checked_add(length_size).ok_or(BitError::Eof)?;
+        if header_end > data.len() {
             return Err(BitError::Eof);
         }
         let mut len = 0usize;
-        for k in 0..length_size {
-            len = (len << 8) | data[i + k] as usize;
+        for &byte in &data[i..header_end] {
+            len = (len << 8) | byte as usize;
         }
-        i += length_size;
-        if i + len > data.len() {
+        i = header_end;
+        let payload_end = i.checked_add(len).ok_or(BitError::Eof)?;
+        if payload_end > data.len() {
             return Err(BitError::Eof);
         }
-        out.push(&data[i..i + len]);
-        i += len;
+        out.push(&data[i..payload_end]);
+        i = payload_end;
     }
     Ok(out)
 }
@@ -410,6 +420,24 @@ mod tests {
         assert_eq!(n, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 9, 9][..]]);
         let l = [0, 0, 0, 2, 0x67, 1, 0, 0, 0, 1, 0x68];
         assert_eq!(length_prefixed_nals(&l, 4).unwrap(), vec![&[0x67, 1][..], &[0x68][..]]);
+    }
+
+    #[test]
+    fn length_prefixed_nals_rejects_invalid_prefix_sizes() {
+        // A zero-length prefix previously caused an infinite loop without advancing.
+        for size in [0, 3, 5, usize::MAX] {
+            assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x65], size), Err(BitError::InvalidNalLengthSize));
+            assert_eq!(length_prefixed_nals(&[], size), Err(BitError::InvalidNalLengthSize));
+        }
+    }
+
+    #[test]
+    fn length_prefixed_nals_enforces_bounds_and_valid_sizes() {
+        assert_eq!(length_prefixed_nals(&[2, 0x67, 0x68], 1).unwrap(), vec![&[0x67, 0x68][..]]);
+        assert_eq!(length_prefixed_nals(&[0, 1, 0x67], 2).unwrap(), vec![&[0x67][..]]);
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x68], 4).unwrap(), vec![&[0x68][..]]);
+        assert_eq!(length_prefixed_nals(&[0, 0, 0], 4), Err(BitError::Eof));
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 3, 0x67, 0x68], 4), Err(BitError::Eof));
     }
 
     #[test]
