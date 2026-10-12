@@ -150,6 +150,76 @@ mod tests {
     }
 
     #[test]
+    fn recover_multiple_dirty_decks_without_replacing_an_open_document() {
+        let dir = temp("recovery-multiple");
+        let mut previous = Session::new();
+        for _ in 0..2 {
+            previous.execute("file.new", &json!({})).unwrap();
+            previous.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+        }
+        assert_eq!(save(&previous, &dir).unwrap(), 2);
+        assert_eq!(list(&dir).len(), 2);
+
+        // A session with an existing clean document must retain it.
+        let mut next = Session::with_new();
+        let original_uid = next.doc().unwrap().uid;
+        let indices = open(&mut next, &dir).unwrap();
+        assert_eq!(indices, vec![1, 2]);
+        assert_eq!(next.documents().len(), 3);
+        assert_eq!(next.documents()[0].uid, original_uid);
+        assert!(!next.documents()[0].is_dirty());
+        for st in &next.documents()[1..] {
+            assert!(st.is_dirty(), "recovered changes must still require saving");
+            assert_eq!(st.doc.slides.len(), 2);
+        }
+        assert!(list(&dir).is_empty(), "entries are consumed only after successful recovery");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_document_discards_stale_autorecovery_without_touching_other_decks() {
+        let dir = temp("recovery-clean");
+        let mut session = Session::with_new();
+        session.execute("slide.new", &json!({})).unwrap();
+        let first_uid = session.doc().unwrap().uid;
+        session.execute("file.new", &json!({})).unwrap();
+        session.execute("slide.new", &json!({})).unwrap();
+        let second_uid = session.doc().unwrap().uid;
+        assert_eq!(save(&session, &dir).unwrap(), 2);
+
+        // Undo is a real state transition back to the last saved snapshot.
+        session.set_active(0);
+        session.execute("edit.undo", &json!({})).unwrap();
+        assert!(!session.doc().unwrap().is_dirty());
+        assert_eq!(save(&session, &dir).unwrap(), 1);
+        let ids: Vec<u64> = list(&dir).iter().map(|entry| entry.0).collect();
+        assert_eq!(ids, vec![second_uid]);
+        assert_ne!(first_uid, second_uid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_opens_valid_decks_with_malformed_metadata() {
+        let dir = temp("recovery-metadata");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut source = Session::with_new();
+        source.execute("slide.new", &json!({})).unwrap();
+        let bytes = deckcraft_format::save(&source.doc().unwrap().doc).unwrap();
+        std::fs::write(dir.join("41.deckcraft"), bytes).unwrap();
+        std::fs::write(dir.join("41.json"), b"{not json").unwrap();
+
+        let mut target = Session::new();
+        assert_eq!(open(&mut target, &dir).unwrap(), vec![0]);
+        let recovered = target.doc().unwrap();
+        assert!(recovered.is_dirty());
+        assert_eq!(recovered.doc.slides.len(), 2);
+        assert!(recovered.path.is_none());
+        assert!(recovered.title().contains("Recovered"));
+        assert!(list(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn corrupt_entries_are_skipped() {
         let dir = temp("recovery-corrupt");
         std::fs::create_dir_all(&dir).unwrap();
