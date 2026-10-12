@@ -262,12 +262,7 @@ mod tests {
         let opts = zip::write::SimpleFileOptions::default();
         z.start_file("mimetype", opts).unwrap();
         z.write_all(MIMETYPE.as_bytes()).unwrap();
-        let manifest = Manifest {
-            format: "deckcraft".into(),
-            version: VERSION,
-            generator: "format regression test".into(),
-            presentation: p.clone(),
-        };
+        let manifest = Manifest { format: "deckcraft".into(), version: VERSION, generator: "format regression test".into(), presentation: p.clone() };
         z.start_file("presentation.json", opts).unwrap();
         z.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
         z.finish().unwrap().into_inner()
