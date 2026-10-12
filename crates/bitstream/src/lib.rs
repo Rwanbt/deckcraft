@@ -15,6 +15,8 @@ pub enum BitError {
     Eof,
     /// An Exp-Golomb code longer than 32 leading zeros.
     InvalidExpGolomb,
+    /// AVCC/HVCC NAL units require a 1-, 2- or 4-byte length prefix.
+    InvalidNalLengthSize,
 }
 
 impl fmt::Display for BitError {
@@ -22,6 +24,7 @@ impl fmt::Display for BitError {
         match self {
             BitError::Eof => f.write_str("unexpected end of bitstream"),
             BitError::InvalidExpGolomb => f.write_str("invalid Exp-Golomb code"),
+            BitError::InvalidNalLengthSize => f.write_str("invalid NAL length-prefix size"),
         }
     }
 }
@@ -312,22 +315,29 @@ pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
 
 /// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1/2/4 bytes) into NAL units.
 pub fn length_prefixed_nals(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
+    // A zero-byte prefix never advances the cursor (infinite loop); overlong prefixes
+    // could overflow offset arithmetic or shift counts on a hostile caller's input.
+    if !matches!(length_size, 1 | 2 | 4) {
+        return Err(BitError::InvalidNalLengthSize);
+    }
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        if i + length_size > data.len() {
+        let header_end = i.checked_add(length_size).ok_or(BitError::Eof)?;
+        if header_end > data.len() {
             return Err(BitError::Eof);
         }
         let mut len = 0usize;
-        for k in 0..length_size {
-            len = (len << 8) | data[i + k] as usize;
+        for &byte in &data[i..header_end] {
+            len = (len << 8) | byte as usize;
         }
-        i += length_size;
-        if i + len > data.len() {
+        i = header_end;
+        let payload_end = i.checked_add(len).ok_or(BitError::Eof)?;
+        if payload_end > data.len() {
             return Err(BitError::Eof);
         }
-        out.push(&data[i..i + len]);
-        i += len;
+        out.push(&data[i..payload_end]);
+        i = payload_end;
     }
     Ok(out)
 }
@@ -410,6 +420,86 @@ mod tests {
         assert_eq!(n, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 9, 9][..]]);
         let l = [0, 0, 0, 2, 0x67, 1, 0, 0, 0, 1, 0x68];
         assert_eq!(length_prefixed_nals(&l, 4).unwrap(), vec![&[0x67, 1][..], &[0x68][..]]);
+    }
+
+    #[test]
+    fn length_prefixed_nals_rejects_invalid_prefix_sizes() {
+        // A zero-length prefix previously caused an infinite loop without advancing.
+        for size in [0, 3, 5, usize::MAX] {
+            assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x65], size), Err(BitError::InvalidNalLengthSize));
+            assert_eq!(length_prefixed_nals(&[], size), Err(BitError::InvalidNalLengthSize));
+        }
+    }
+
+    #[test]
+    fn length_prefixed_nals_enforces_bounds_and_valid_sizes() {
+        assert_eq!(length_prefixed_nals(&[2, 0x67, 0x68], 1).unwrap(), vec![&[0x67, 0x68][..]]);
+        assert_eq!(length_prefixed_nals(&[0, 1, 0x67], 2).unwrap(), vec![&[0x67][..]]);
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 0x68], 4).unwrap(), vec![&[0x68][..]]);
+        assert_eq!(length_prefixed_nals(&[0, 0, 0], 4), Err(BitError::Eof));
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 3, 0x67, 0x68], 4), Err(BitError::Eof));
+    }
+
+    #[test]
+    fn reader_reports_truncation_and_excessive_exp_golomb_prefix() {
+        assert_eq!(BitReader::new(&[]).read_ue(), Err(BitError::Eof));
+        assert_eq!(BitReader::new(&[0; 4]).read_ue(), Err(BitError::Eof));
+        assert_eq!(BitReader::new(&[0; 5]).read_ue(), Err(BitError::InvalidExpGolomb));
+
+        let mut writer = BitWriter::new();
+        writer.write_ue(u32::MAX);
+        let bytes = writer.finish();
+        assert_eq!(BitReader::new(&bytes).read_ue(), Ok(u32::MAX));
+    }
+
+    #[test]
+    fn unaligned_writes_and_reads_preserve_exact_payload_bits() {
+        let mut writer = BitWriter::new();
+        writer.write_bits(0b101, 3);
+        writer.write_bytes(&[0xA5, 0xFF]);
+        assert_eq!(writer.bit_len(), 19);
+        writer.align_zero();
+        let encoded = writer.finish();
+        assert_eq!(encoded.len(), 3);
+
+        let mut reader = BitReader::new(&encoded);
+        assert_eq!(reader.peek(3), 0b101);
+        assert_eq!(reader.position(), 0, "peek must not advance the cursor");
+        assert_eq!(reader.read_bits(3), Ok(0b101));
+        assert_eq!(reader.read_bits(8), Ok(0xA5));
+        assert_eq!(reader.read_bits(8), Ok(0xFF));
+        assert_eq!(reader.read_bits(5), Ok(0));
+        assert_eq!(reader.bits_left(), 0);
+    }
+
+    #[test]
+    fn length_prefixed_nals_roundtrip_fixed_seed_corpus() {
+        let mut seed = 0x7A11_2026_5EED_u64;
+        let mut chunks = Vec::new();
+        for len in 0..64 {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (seed >> 32) as u8
+                })
+                .collect();
+            chunks.push(data);
+        }
+
+        for prefix_size in [1usize, 2, 4] {
+            let mut encoded = Vec::new();
+            for chunk in &chunks {
+                for offset in (0..prefix_size).rev() {
+                    encoded.push((chunk.len() >> (8 * offset)) as u8);
+                }
+                encoded.extend_from_slice(chunk);
+            }
+            let parsed = length_prefixed_nals(&encoded, prefix_size).unwrap();
+            assert_eq!(parsed.len(), chunks.len());
+            for (actual, expected) in parsed.iter().zip(&chunks) {
+                assert_eq!(*actual, expected.as_slice(), "NAL payload must be lossless");
+            }
+        }
     }
 
     #[test]
