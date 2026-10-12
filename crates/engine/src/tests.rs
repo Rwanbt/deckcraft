@@ -193,6 +193,41 @@ fn save_and_reopen_native() {
 }
 
 #[test]
+fn failed_save_as_keeps_unsaved_changes_and_document_identity() {
+    let mut s = Session::with_new();
+    s.execute("slide.new", &json!({})).unwrap();
+    let original = s.doc().unwrap().doc.clone();
+    let original_uid = s.doc().unwrap().uid;
+    let missing = std::env::temp_dir().join(format!("deckcraft-missing-save-parent-{}", std::process::id())).join("not-created.deckcraft");
+    // The parent is intentionally not created, so no host-specific permissions are needed.
+    assert!(!missing.parent().unwrap().exists());
+    let result = s.execute("file.saveAs", &json!({"path": missing.to_string_lossy()}));
+    assert!(result.is_err(), "saving into a missing directory must fail");
+    let st = s.doc().unwrap();
+    assert!(st.is_dirty(), "failed save must not mark the deck saved");
+    assert_eq!(st.uid, original_uid);
+    assert!(st.path.is_none(), "failed save must not change the document path");
+    assert!(std::sync::Arc::ptr_eq(&st.doc, &original));
+    assert_eq!(st.doc.slides.len(), 2);
+}
+
+#[test]
+fn failed_open_never_replaces_or_closes_the_current_document() {
+    let mut s = Session::with_new();
+    s.execute("slide.new", &json!({})).unwrap();
+    let original = s.doc().unwrap().doc.clone();
+    let original_uid = s.doc().unwrap().uid;
+    // Valid base64 that decodes to a broken archive; no filesystem dependency.
+    assert!(s.execute("file.openBytes", &json!({"name": "broken.deckcraft", "data": "UEsDBGJhZA=="})).is_err());
+    let st = s.doc().unwrap();
+    assert_eq!(s.documents().len(), 1);
+    assert_eq!(st.uid, original_uid);
+    assert!(std::sync::Arc::ptr_eq(&st.doc, &original));
+    assert!(st.is_dirty());
+    assert_eq!(st.doc.slides.len(), 2);
+}
+
+#[test]
 fn every_command_survives_empty_and_hostile_params() {
     let mut s = Session::new();
     sample::open_sample(&mut s).unwrap();
