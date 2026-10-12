@@ -106,8 +106,12 @@ pub fn load(bytes: &[u8]) -> Result<Presentation> {
     }
     let mut p = m.presentation;
     for item in &mut p.media {
-        if let Ok(data) = read_entry(&mut z, &format!("media/{}", item.id.0)) {
-            item.data = Arc::new(data);
+        let name = format!("media/{}", item.id.0);
+        match read_entry(&mut z, &name) {
+            Ok(data) => item.data = Arc::new(data),
+            // External-only media have no ZIP entry; embedded media must never vanish silently.
+            Err(_) if item.link.is_some() => {}
+            Err(err) => return Err(err),
         }
     }
     repair(&mut p);
@@ -249,6 +253,56 @@ mod tests {
         repair(&mut p);
         assert!(p.validate().is_empty());
         assert_eq!(p.slide_size.width, 960.0);
+    }
+
+    /// A syntactically valid archive whose manifest references media with no corresponding
+    /// ZIP entry. It models a damaged save without relying on byte-offset corruption.
+    fn archive_missing_media(p: &Presentation) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        z.start_file("mimetype", opts).unwrap();
+        z.write_all(MIMETYPE.as_bytes()).unwrap();
+        let manifest = Manifest {
+            format: "deckcraft".into(),
+            version: VERSION,
+            generator: "format regression test".into(),
+            presentation: p.clone(),
+        };
+        z.start_file("presentation.json", opts).unwrap();
+        z.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        z.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn missing_embedded_media_is_a_damaged_file_not_silent_data_loss() {
+        let mut p = Presentation::default();
+        let media_id = p.add_media("diagram.png", "image/png", vec![1, 2, 3, 4]);
+        let damaged = archive_missing_media(&p);
+        assert!(matches!(
+            load(&damaged),
+            Err(FormatError::Damaged(message))
+                if message.contains(&format!("media/{}", media_id.0))
+        ));
+    }
+
+    #[test]
+    fn external_link_without_embedded_bytes_is_still_loadable() {
+        let mut p = Presentation::default();
+        let media_id = p.add_media("remote.png", "image/png", vec![]);
+        p.media[0].link = Some("https://example.invalid/remote.png".into());
+        let external_only = archive_missing_media(&p);
+        let loaded = load(&external_only).unwrap();
+        let media = loaded.media(media_id).unwrap();
+        assert_eq!(media.link.as_deref(), Some("https://example.invalid/remote.png"));
+        assert!(media.data.is_empty());
+    }
+
+    #[test]
+    fn valid_embedded_media_with_empty_bytes_is_not_mistaken_for_missing() {
+        let mut p = Presentation::default();
+        let id = p.add_media("empty.bin", "application/octet-stream", vec![]);
+        let loaded = load(&save(&p).unwrap()).unwrap();
+        assert!(loaded.media(id).unwrap().data.is_empty());
     }
 
     #[test]
