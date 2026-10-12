@@ -88,11 +88,8 @@ fn executable_rejects_corrupt_input_and_invalid_commands() {
     let info = Command::new(binary()).arg("info").arg(&broken).output().expect("open corrupt deck");
     assert!(!info.status.success(), "corrupt input must not be reported as a valid presentation");
 
-    let invalid = Command::new(binary())
-        .args(["run", "--cmd", "a.command.that.does.not.exist", "--save"])
-        .arg(&output)
-        .output()
-        .expect("run invalid command");
+    let invalid =
+        Command::new(binary()).args(["run", "--cmd", "a.command.that.does.not.exist", "--save"]).arg(&output).output().expect("run invalid command");
     assert!(!invalid.status.success());
     assert!(!output.exists(), "failed command must not save a partial deck");
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("a.command.that.does.not.exist"));
@@ -100,17 +97,15 @@ fn executable_rejects_corrupt_input_and_invalid_commands() {
 
 #[test]
 fn executable_mcp_stdio_exchanges_jsonrpc_and_terminates_on_eof() {
-    let mut child = Command::new(binary())
-        .arg("mcp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn MCP server");
+    let mut child =
+        Command::new(binary()).arg("mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn MCP server");
     let requests = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":3,"method":"no.such.method","params":{}}"#, "\n"
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"no.such.method","params":{}}"#,
+        "\n"
     );
     child.stdin.take().expect("stdin pipe").write_all(requests.as_bytes()).expect("write protocol requests");
     let output = child.wait_with_output().expect("MCP server should finish at EOF");
