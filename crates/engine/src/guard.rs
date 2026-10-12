@@ -35,7 +35,9 @@ pub fn install_panic_hook() {
 impl Session {
     /// Run command `id` (`f`) inside the guard.
     pub(crate) fn guarded(&mut self, id: &str, f: impl FnOnce(&mut Session) -> Result<Value>) -> Result<Value> {
-        let before = self.active().map(|d| (d.uid, d.doc.clone(), d.selection.clone(), d.revision));
+        let before = self.active().map(|d| (d.uid, d.doc.clone(), d.selection.clone(), d.revision, d.history.clone(), d.interaction.clone()));
+        let journal_len = self.journal.len();
+        let requests_len = self.ui_requests.len();
         let depth = self.depth;
         match catch_unwind(AssertUnwindSafe(|| f(self))) {
             Ok(r) => r,
@@ -43,14 +45,21 @@ impl Session {
                 self.depth = depth;
                 let msg = panic_message(payload.as_ref());
                 // Keep the document as it was before the command.
-                if let (Some((uid, doc, selection, revision)), Some(st)) = (before, self.active_mut())
+                if let (Some((uid, doc, selection, revision, history, interaction)), Some(st)) = (before, self.active_mut())
                     && st.uid == uid
                 {
                     st.doc = doc;
                     st.selection = selection;
-                    st.interaction = None;
+                    // A nested command can have pushed undo, cleared redo or started an
+                    // interaction before a later step panics. Restore the checkpoint.
+                    st.history = history;
+                    st.interaction = interaction;
                     st.revision = revision.max(st.revision).saturating_add(1);
                 }
+                // A nested command may also have already appended an event or UI request.
+                // Neither belongs to the failed outer command.
+                self.journal.truncate(journal_len);
+                self.ui_requests.truncate(requests_len);
                 log::error!("command `{id}` panicked: {msg}");
                 if let Some(dir) = self.recovery_dir.clone()
                     && let Err(e) = crate::recovery::save(self, &dir)
@@ -68,6 +77,39 @@ mod tests {
     use serde_json::json;
 
     use crate::Session;
+
+    #[test]
+    fn panicking_nested_command_restores_undo_redo_and_side_effect_queues() {
+        let mut s = Session::with_new();
+        s.execute("slide.new", &json!({})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        let previous = s.doc().unwrap().doc.clone();
+        let undo_len = s.doc().unwrap().history.undo.len();
+        let redo_len = s.doc().unwrap().history.redo.len();
+        let journal_len = s.journal.len();
+        let requests_len = s.ui_requests.len();
+        assert!(redo_len > 0, "test requires an existing redo entry");
+
+        let error = s
+            .guarded("test.nested-panic", |s| {
+                s.execute("slide.new", &json!({}))?;
+                s.ui_requests.push(crate::UiRequest::Pane { id: "unexpected".into() });
+                panic!("rollback");
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("rollback"));
+        let state = s.doc().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&state.doc, &previous));
+        assert_eq!(state.history.undo.len(), undo_len);
+        assert_eq!(state.history.redo.len(), redo_len);
+        assert_eq!(s.journal.len(), journal_len);
+        assert_eq!(s.ui_requests.len(), requests_len);
+
+        // The redo from before the panic must still be usable.
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.slides.len(), 2);
+    }
 
     #[test]
     fn a_panicking_command_is_an_error_and_keeps_the_document() {
