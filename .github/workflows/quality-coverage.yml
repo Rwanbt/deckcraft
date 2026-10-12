@@ -1,0 +1,54 @@
+name: Quality coverage (core formats)
+
+# Incremental instrumented baseline for high-risk format/bitstream paths.
+# Existing ci.yml remains the complete workspace quality gate.
+on:
+  pull_request:
+    paths:
+      - "crates/format/**"
+      - "crates/pptx/**"
+      - "crates/bitstream/**"
+      - ".github/workflows/quality-coverage.yml"
+      - "docs/quality/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: core-format-llvm-cov
+      - name: Install instrumented coverage runner
+        run: cargo install cargo-llvm-cov --locked
+      - name: Instrumented tests for high-risk core crates
+        run: |
+          cargo llvm-cov --locked \
+            -p deckcraft-bitstream \
+            -p deckcraft-format \
+            -p deckcraft-pptx \
+            --lcov --output-path coverage-core.lcov
+          cargo llvm-cov report --json --output-path coverage-core.json
+          cargo llvm-cov report --summary-only
+      - name: Upload instrumented baseline
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-core-${{ github.sha }}
+          path: |
+            coverage-core.lcov
+            coverage-core.json
+          if-no-files-found: warn
+          retention-days: 30
